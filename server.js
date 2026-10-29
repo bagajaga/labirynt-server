@@ -1,13 +1,69 @@
+Krótka odpowiedź: **Nie, te zmiany zużyją praktycznie zero zasobów**. Wręcz przeciwnie – zapobiegną marnowaniu zasobów na ciągłe restarty serwera.
+
+Oto dlaczego to jest całkowicie bezpieczne dla Twojego darmowego planu (0.1 vCPU, 256 MB RAM):
+
+1. **Heartbeat (ping)**: Wysyłanie `ping` przez WebSocket to nie jest zwykła wiadomość tekstowa. To ramka kontrolna na poziomie protokołu, która waży zaledwie kilka bajtów. Serwer wysyła ją raz na 30 sekund. Obciążenie procesora jest niemierzalne (bliskie 0%), a zużycie transferu to kilka kilobajtów na godzinę.
+2. **Endpoint `/health`**: Jeśli platforma Suga zapyta o ten adres, serwer odeśle kilkanaście bajtów JSON. Node.js obsługuje tysiące takich zapytań na sekundę bez zająknięcia. Dla Twojej gry to jak kropla w morzu.
+3. **SIGTERM**: Ten kod uruchamia się *tylko wtedy*, gdy platforma chce zrestartować serwer (np. przy wdrażaniu nowej wersji). Przez resztę czasu po prostu „śpi” i nie zużywa nic.
+
+### 💡 Dlaczego to jest opłacalne?
+Bez heartbeatu platforma Suga mogła uznać, że serwer „umarł” (bo przez chwilę nie było ruchu w grze), zabić proces (`SIGTERM` z Twoich logów) i uruchomić go od nowa. **Restart serwera to dopiero zużycie zasobów** (procesor musi załadować Node.js, pliki, itp.) oraz – co gorsza – zerwanie połączeń wszystkim graczom. Heartbeat sprawia, że serwer jest stale „widziany” jako żywy, więc nie ma niepotrzebnych restartów.
+
+Dla Twojej gry (kilku graczy, tury, mały ruch) te mechanizmy są jak pielęgniarka sprawdzająca puls – nie obciążają pacjenta, a pozwalają uniknąć nagłego zawału.
+
+---
+
+### 🛠️ Ostateczny, bezpieczny `server.js`
+
+Aby uniknąć błędów z konfiguracją, przygotowałem dla Ciebie kompletny plik `server.js`, który zawiera zarówno Twoją logikę pokoi, jak i te nowe zabezpieczenia. Skopiuj go w całości, wgraj na GitHuba i zrób **Redeploy** w Suga.
+
+```javascript
+const http = require('http');
 const WebSocket = require('ws');
+
 const PORT = process.env.PORT || 3000;
-const wss = new WebSocket.Server({ port: PORT });
+
+// 1. Serwer HTTP (dla health checka i podpięcia WebSocketów)
+const server = http.createServer((req, res) => {
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', rooms: Object.keys(rooms).length }));
+  } else {
+    res.writeHead(404);
+    res.end();
+  }
+});
+
+// 2. Serwer WebSocket podpięty pod ten sam port
+const wss = new WebSocket.Server({ server });
 
 // rooms[code] = { host: ws|null, n: number, codes: string[], seats: (ws|null)[] }
 const rooms = {};
 
 console.log(`Labirynt server running on port ${PORT}`);
 
+// 3. Heartbeat (co 30 sekund sprawdza, czy klienci żyją)
+setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30000);
+
+// 4. Łagodne zamykanie przy restarcie (SIGTERM)
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, closing server...');
+  wss.clients.forEach((ws) => {
+    ws.close(1001, 'Server restarting');
+  });
+  process.exit(0);
+});
+
 wss.on('connection', (ws) => {
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
   let roomCode = null;
   let seat = -1;
 
@@ -69,7 +125,6 @@ wss.on('connection', (ws) => {
       }
       const seatIndex = idx + 1;
       
-      // Sprawdzamy, czy miejsce nie jest zajęte przez AKTYWNE połączenie
       if (room.seats[seatIndex] && room.seats[seatIndex].readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'error', message: 'Ten kod jest już użyty.' }));
         return;
@@ -108,7 +163,6 @@ wss.on('connection', (ws) => {
     const room = rooms[roomCode];
 
     if (room.host === ws) {
-      // Zamiast usuwać, dajemy hostowi 15 sekund na powrót (np. odświeżenie)
       room.host = null;
       room.seats[0] = null;
       broadcastRoom(room, { type: 'room_state', seats: room.seats.map(s => !!s) });
@@ -127,7 +181,6 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // Gracz wyszedł
     const idx = room.seats.indexOf(ws);
     if (idx > 0) {
       room.seats[idx] = null;
@@ -144,3 +197,9 @@ function broadcastRoom(room, msg) {
     if (s && s.readyState === WebSocket.OPEN) s.send(raw);
   }
 }
+
+// Uruchomienie serwera
+server.listen(PORT, () => {
+  console.log(`HTTP server (health) listening on port ${PORT}`);
+});
+```
