@@ -1,23 +1,3 @@
-Krótka odpowiedź: **Nie, te zmiany zużyją praktycznie zero zasobów**. Wręcz przeciwnie – zapobiegną marnowaniu zasobów na ciągłe restarty serwera.
-
-Oto dlaczego to jest całkowicie bezpieczne dla Twojego darmowego planu (0.1 vCPU, 256 MB RAM):
-
-1. **Heartbeat (ping)**: Wysyłanie `ping` przez WebSocket to nie jest zwykła wiadomość tekstowa. To ramka kontrolna na poziomie protokołu, która waży zaledwie kilka bajtów. Serwer wysyła ją raz na 30 sekund. Obciążenie procesora jest niemierzalne (bliskie 0%), a zużycie transferu to kilka kilobajtów na godzinę.
-2. **Endpoint `/health`**: Jeśli platforma Suga zapyta o ten adres, serwer odeśle kilkanaście bajtów JSON. Node.js obsługuje tysiące takich zapytań na sekundę bez zająknięcia. Dla Twojej gry to jak kropla w morzu.
-3. **SIGTERM**: Ten kod uruchamia się *tylko wtedy*, gdy platforma chce zrestartować serwer (np. przy wdrażaniu nowej wersji). Przez resztę czasu po prostu „śpi” i nie zużywa nic.
-
-### 💡 Dlaczego to jest opłacalne?
-Bez heartbeatu platforma Suga mogła uznać, że serwer „umarł” (bo przez chwilę nie było ruchu w grze), zabić proces (`SIGTERM` z Twoich logów) i uruchomić go od nowa. **Restart serwera to dopiero zużycie zasobów** (procesor musi załadować Node.js, pliki, itp.) oraz – co gorsza – zerwanie połączeń wszystkim graczom. Heartbeat sprawia, że serwer jest stale „widziany” jako żywy, więc nie ma niepotrzebnych restartów.
-
-Dla Twojej gry (kilku graczy, tury, mały ruch) te mechanizmy są jak pielęgniarka sprawdzająca puls – nie obciążają pacjenta, a pozwalają uniknąć nagłego zawału.
-
----
-
-### 🛠️ Ostateczny, bezpieczny `server.js`
-
-Aby uniknąć błędów z konfiguracją, przygotowałem dla Ciebie kompletny plik `server.js`, który zawiera zarówno Twoją logikę pokoi, jak i te nowe zabezpieczenia. Skopiuj go w całości, wgraj na GitHuba i zrób **Redeploy** w Suga.
-
-```javascript
 const http = require('http');
 const WebSocket = require('ws');
 
@@ -202,4 +182,3 @@ function broadcastRoom(room, msg) {
 server.listen(PORT, () => {
   console.log(`HTTP server (health) listening on port ${PORT}`);
 });
-```
