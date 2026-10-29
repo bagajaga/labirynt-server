@@ -2,7 +2,7 @@ const WebSocket = require('ws');
 const PORT = process.env.PORT || 3000;
 const wss = new WebSocket.Server({ port: PORT });
 
-// rooms[code] = { host: ws, n: number, codes: string[], seats: (ws|null)[] }
+// rooms[code] = { host: ws|null, n: number, codes: string[], seats: (ws|null)[] }
 const rooms = {};
 
 console.log(`Labirynt server running on port ${PORT}`);
@@ -15,12 +15,23 @@ wss.on('connection', (ws) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
 
-    // ============ HOST: tworzy pokój ============
+    // ============ HOST: tworzy lub wznawia pokój ============
     if (msg.type === 'create') {
       roomCode = String(msg.code || '');
       const n = Math.max(2, Math.min(4, msg.n || 2));
       const codes = Array.isArray(msg.codes) ? msg.codes.map(String) : [];
 
+      // Jeśli pokój istnieje, ale host uciekł (ma null), wznawiamy go
+      if (rooms[roomCode] && rooms[roomCode].host === null) {
+        rooms[roomCode].host = ws;
+        rooms[roomCode].seats[0] = ws;
+        seat = 0;
+        ws.send(JSON.stringify({ type: 'created', code: roomCode }));
+        broadcastRoom(rooms[roomCode], { type: 'room_state', seats: rooms[roomCode].seats.map(s => !!s) });
+        return;
+      }
+
+      // Jeśli pokój istnieje i host jest aktywny, niszczymy stary
       if (rooms[roomCode]) {
         try { rooms[roomCode].host?.close(); } catch {}
         for (const s of rooms[roomCode].seats) {
@@ -50,18 +61,16 @@ wss.on('connection', (ws) => {
         ws.send(JSON.stringify({ type: 'error', message: 'Nie znaleziono pokoju o tym kodzie.' }));
         return;
       }
-      if (!room.seats.some(s => !s)) {
-        ws.send(JSON.stringify({ type: 'error', message: 'Pokój jest pełny.' }));
-        return;
-      }
-
+      
       const idx = room.codes.indexOf(playerCode);
       if (idx < 0) {
         ws.send(JSON.stringify({ type: 'error', message: 'Nieprawidłowy kod gracza.' }));
         return;
       }
       const seatIndex = idx + 1;
-      if (room.seats[seatIndex]) {
+      
+      // Sprawdzamy, czy miejsce nie jest zajęte przez AKTYWNE połączenie
+      if (room.seats[seatIndex] && room.seats[seatIndex].readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'error', message: 'Ten kod jest już użyty.' }));
         return;
       }
@@ -69,10 +78,7 @@ wss.on('connection', (ws) => {
       room.seats[seatIndex] = ws;
       seat = seatIndex;
 
-      // 1) Poinformuj dołączającego o jego miejscu
       ws.send(JSON.stringify({ type: 'joined', seat: seatIndex }));
-
-      // 2) Host dostanie room_state i rozgłosi pełny stan gry do wszystkich
       broadcastRoom(room, { type: 'room_state', seats: room.seats.map(s => !!s) });
       return;
     }
@@ -82,14 +88,12 @@ wss.on('connection', (ws) => {
     if (!room) return;
 
     if (room.host === ws) {
-      // host → wszyscy gracze
       const raw2 = raw.toString();
       for (let i = 1; i < room.seats.length; i++) {
         const s = room.seats[i];
         if (s && s.readyState === WebSocket.OPEN) s.send(raw2);
       }
     } else {
-      // gracz → tylko host (z informacją, z którego miejsca)
       const seatIdx = room.seats.indexOf(ws);
       if (seatIdx < 0) return;
       const enriched = { ...msg, _fromSeat: seatIdx };
@@ -104,18 +108,26 @@ wss.on('connection', (ws) => {
     const room = rooms[roomCode];
 
     if (room.host === ws) {
-      // Host wyszedł → rozwiąż pokój
-      for (const s of room.seats) {
-        if (s && s !== ws && s.readyState === WebSocket.OPEN) {
-          s.send(JSON.stringify({ type: 'error', message: 'Host opuścił pokój.' }));
-          s.close();
+      // Zamiast usuwać, dajemy hostowi 15 sekund na powrót (np. odświeżenie)
+      room.host = null;
+      room.seats[0] = null;
+      broadcastRoom(room, { type: 'room_state', seats: room.seats.map(s => !!s) });
+      
+      setTimeout(() => {
+        if (rooms[roomCode] && rooms[roomCode].host === null) {
+          for (const s of rooms[roomCode].seats) {
+            if (s && s.readyState === WebSocket.OPEN) {
+              s.send(JSON.stringify({ type: 'error', message: 'Host opuścił pokój.' }));
+              s.close();
+            }
+          }
+          delete rooms[roomCode];
         }
-      }
-      delete rooms[roomCode];
+      }, 15000);
       return;
     }
 
-    // Gracz wyszedł → zwolnij miejsce, poinformuj hosta i pozostałych
+    // Gracz wyszedł
     const idx = room.seats.indexOf(ws);
     if (idx > 0) {
       room.seats[idx] = null;
